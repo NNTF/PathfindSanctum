@@ -57,13 +57,20 @@ public class RewardHelper(
         {"Stacked Deck", 2},
         {"Vaal Orb", 0.17},
         {"Veiled Orb", 1700},
-        {"Veiled Scarab", 1}
+        {"Veiled Scarab", 1},
+        {"Volatile Vaal Orb", 900}
     };
 
     bool usingDivinity = false;
     SanctumFloorWindow floorWindow;
     SanctumRewardWindow sanctumRewardWindow;
+    IList<Element> rewardElements;
     int floor;
+
+    // ExileCore's SanctumRewardWindowOffsets is stale on the current client; the reward container pointer now sits here.
+    private const int SanctumRewardArrayContainerOffset = 0x2F0;
+
+    private readonly Dictionary<string, double> currencyValueCache = new();
 
     public void DrawRewards()
     {
@@ -71,11 +78,19 @@ public class RewardHelper(
         floor = stateTracker.PlayerFloor;
         floorWindow = gameState.IngameUi.SanctumFloorWindow;
         sanctumRewardWindow = gameState.IngameUi.SanctumRewardWindow;
-        if (floorWindow == null || !sanctumRewardWindow.IsVisible || sanctumRewardWindow.RewardElements.Count == 0 || sanctumRewardWindow.RewardElements[0].ChildCount >= 3)
+        if (floorWindow == null || sanctumRewardWindow == null || !sanctumRewardWindow.IsVisible)
             return;
 
-        var rewardValues = GetRewardValues(sanctumRewardWindow.RewardElements);
+        rewardElements = ResolveRewardElements(sanctumRewardWindow);
+        if (rewardElements is not { Count: > 0 } || rewardElements[0].ChildCount >= 3)
+            return;
+
+        currencyValueCache.Clear();
+
+        var rewardValues = GetRewardValues(rewardElements);
         DrawDivinityText(usingDivinity, sanctumRewardWindow.PositionNum);
+        if (rewardValues.Count == 0)
+            return;
 
         if (usingDivinity)
         {
@@ -94,6 +109,25 @@ public class RewardHelper(
         public double Value;
     }
 
+    private static IList<Element> ResolveRewardElements(SanctumRewardWindow window)
+    {
+        if (window.RewardElements is { Count: > 0 } elements)
+            return elements;
+
+        try
+        {
+            var containerAddress = window.M.Read<long>(window.Address + SanctumRewardArrayContainerOffset);
+            if (containerAddress != 0)
+                return window.TheGame.GetObject<Element>(containerAddress)?.Children;
+        }
+        catch
+        {
+            // stale offset after a client patch, fall through
+        }
+
+        return null;
+    }
+
     private void DrawDivinityText(bool usingDivinity, Vector2 position)
     {
         string text = usingDivinity ? "Divinity Detected" : "No Divinity Detected";
@@ -110,7 +144,7 @@ public class RewardHelper(
             {
                 DrawBestReward(reward, rewardPos);
             }
-            else if (reward.Key.Address != sanctumRewardWindow.RewardElements.Last().Address || floor == 4 || !usingDivinity)
+            else if (reward.Key.Address != rewardElements.Last().Address || floor == 4 || !usingDivinity)
             {
                 DrawNonBestReward(reward, rewardPos);
             }
@@ -147,63 +181,42 @@ public class RewardHelper(
         graphics.DrawText($"{reward.Value.Count}x {reward.Value.Name}", new Vector2(rewardPos.Center.X, rewardPos.Center.Y) + new Vector2(0, 20), SharpDX.Color.White, 45, FontAlign.Center);
     }
 
-    private void DrawFloor4InfoText(Vector2 position, int pactCounter, int rewardsWeCanTake, int divCounter)
+    private void DrawFloor4InfoText(Vector2 position, int pactCounter, int rewardsWeCanTake, int highValueRoomCount)
     {
-        graphics.DrawText($"Divines Remaining: {divCounter}", position - new Vector2(160, 0), SharpDX.Color.White, 25, FontAlign.Left);
+        graphics.DrawText($"High Value Rooms Remaining: {highValueRoomCount}", position - new Vector2(160, 0), SharpDX.Color.White, 25, FontAlign.Left);
         graphics.DrawText($"Pacts Remaining: {pactCounter}", position - new Vector2(160, -20), SharpDX.Color.White, 25, FontAlign.Left);
         graphics.DrawText($"Rewards We Can Take: {rewardsWeCanTake}", position - new Vector2(160, -40), SharpDX.Color.White, 25, FontAlign.Left);
     }
 
     private void DrawRewardsForFloor4(Dictionary<Element, Reward> rewardValues)
     {
-        var (divCounter, pactCounter, rewardsWeCanTake) = CalculateFloor4Metrics();
+        var (highValueRoomCount, pactCounter, rewardsWeCanTake) = CalculateFloor4Metrics();
 
-        DrawFloor4InfoText(sanctumRewardWindow.PositionNum, pactCounter, rewardsWeCanTake, divCounter);
+        DrawFloor4InfoText(sanctumRewardWindow.PositionNum, pactCounter, rewardsWeCanTake, highValueRoomCount);
 
-        if (divCounter <= 1 && rewardsWeCanTake >= 1 && !IsInPactRoom())
-        {
-            DrawSelectedRewardsForFloor4(rewardValues, rewardsWeCanTake);
-        }
-        else
-        {
-            // Idk what this one does
-            if (rewardValues.Any(x => x.Value.Name.Contains("Divine Orb") || x.Value.Name.Contains("Mirror")) || rewardsWeCanTake >= 1 && pactCounter == 0)
-            {
-                DrawRewardElements(rewardValues, rewardValues.OrderByDescending(x => x.Value.Value).FirstOrDefault());
-            }
-            else
-            {
-                DrawRewardElements(rewardValues, rewardValues.FirstOrDefault());
-            }
-        }
-    }
+        var best = SelectBest(rewardValues);
 
-    private void DrawSelectedRewardsForFloor4(Dictionary<Element, Reward> rewardValues, int rewardsWeCanTake)
-    {
-        var selectedRewards = rewardValues.OrderByDescending(x => x.Value.Value)
-                                          .Take(rewardsWeCanTake);
-        if (selectedRewards.Any())
+        if (highValueRoomCount <= 1 && rewardsWeCanTake >= 1 && !IsInPactRoom())
         {
-            DrawRewardElements(rewardValues, selectedRewards.FirstOrDefault());
-        }
-        else
-        {
-            DrawRewardElements(rewardValues, rewardValues.FirstOrDefault());
+            DrawRewardElements(rewardValues, best);
             return;
         }
+
+        // No duplication budget left: keep the immediate reward unless something is worth at least a Divine.
+        var immediate = rewardValues.First();
+        DrawRewardElements(rewardValues, best.Value.Value >= GetCurrencyValue("Divine Orb") ? best : immediate);
     }
 
     private void DrawRewardsSimple(Dictionary<Element, Reward> rewardValues)
     {
-        var bestReward = rewardValues.OrderByDescending(x => x.Value.Value).FirstOrDefault();
-        DrawRewardElements(rewardValues, bestReward);
+        DrawRewardElements(rewardValues, SelectBest(rewardValues));
     }
 
     private void DrawRewardsDivinity(Dictionary<Element, Reward> rewardValues)
     {
         if (floor <= 2)
         {
-            var bestReward = GetBestReward(rewardValues, sanctumRewardWindow, 1);
+            var bestReward = GetBestReward(rewardValues, rewardElements, 1);
             DrawRewardElements(rewardValues, bestReward);
         }
         else if (floor == 3)
@@ -217,13 +230,25 @@ public class RewardHelper(
         }
     }
 
+    private static bool IsMirror(string currencyName) =>
+        currencyName != null && currencyName.Contains("Mirror", StringComparison.OrdinalIgnoreCase);
+
+    /** A Mirror outranks everything else, whatever its computed value. Ties keep the offer order. */
+    private static KeyValuePair<Element, Reward> SelectBest(IEnumerable<KeyValuePair<Element, Reward>> candidates)
+    {
+        return candidates.OrderByDescending(x => IsMirror(x.Value.Name))
+                         .ThenByDescending(x => x.Value.Value)
+                         .FirstOrDefault();
+    }
+
     /** Select the best reward, skipping the last one or two unless they are divine/mirror */
-private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, Reward> rewardValues, SanctumRewardWindow sanctumRewardWindow, int skipCount)
+private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, Reward> rewardValues, IList<Element> rewardElements, int skipCount)
 {
-    var lastRewards = sanctumRewardWindow.RewardElements.TakeLast(skipCount).Select(e => e.Address).ToHashSet();
-    return rewardValues.Where(x => !lastRewards.Contains(x.Key.Address) || x.Value.Name.Contains("Mirror", StringComparison.OrdinalIgnoreCase) || x.Value.Name.Contains("Divine Orb", StringComparison.OrdinalIgnoreCase))
-                       .OrderByDescending(x => x.Value.Value)
-                       .FirstOrDefault();
+    var mirror = rewardValues.FirstOrDefault(x => IsMirror(x.Value.Name));
+    if (mirror.Key != null) return mirror;
+
+    var lastRewards = rewardElements.TakeLast(skipCount).Select(e => e.Address).ToHashSet();
+    return SelectBest(rewardValues.Where(x => !lastRewards.Contains(x.Key.Address) || x.Value.Name.Contains("Divine Orb", StringComparison.OrdinalIgnoreCase) || x.Value.Name.Contains("Volatile Vaal Orb", StringComparison.OrdinalIgnoreCase)));
 }
 
     private bool IsInPactRoom()
@@ -247,31 +272,7 @@ private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, R
         var rewardName = match.Groups["rewardname"].Value.Trim();
         if (!int.TryParse(match.Groups["rewardcount"].ValueSpan.Trim(), out var stackSize)) continue;
 
-        var baseName = rewardName.Replace("Orbs", "Orb").Replace("Mirrors", "Mirror").TrimEnd('s');
-        if (rewardName.Equals("Orb of Horizon", StringComparison.OrdinalIgnoreCase))
-        {
-            baseName = "Orb of Horizons";
-        }
-
-            var data = new BaseItemType
-            {
-                BaseName = baseName,
-                ClassName = "StackableCurrency",
-                Metadata = ""
-            };
-            double value;
-            var fn = pluginBridge.GetMethod<Func<BaseItemType, double>>("NinjaPrice.GetBaseItemTypeValue");
-            if (fn != null)
-            {
-                value = fn(data) * stackSize;
-                if(value == 0) {
-                    value = baseCurrencyValues.GetValueOrDefault(data.BaseName, 0) * stackSize;
-                }
-            }
-            else
-            {
-                value = baseCurrencyValues.GetValueOrDefault(data.BaseName, 0) * stackSize;
-            }
+        var value = GetCurrencyValue(rewardName) * stackSize;
 
         rewardValues.Add(reward, new Reward { Name = rewardName, Count = stackSize, Value = value });
     }
@@ -279,24 +280,53 @@ private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, R
     return rewardValues;
 }
 
+    private double GetCurrencyValue(string currencyName)
+    {
+        if (string.IsNullOrEmpty(currencyName)) return 0;
+        if (currencyValueCache.TryGetValue(currencyName, out var cached)) return cached;
+
+        var baseName = currencyName.Replace("Orbs", "Orb").Replace("Mirrors", "Mirror").TrimEnd('s');
+        if (currencyName.Equals("Orb of Horizon", StringComparison.OrdinalIgnoreCase))
+        {
+            baseName = "Orb of Horizons";
+        }
+
+        var data = new BaseItemType
+        {
+            BaseName = baseName,
+            ClassName = "StackableCurrency",
+            Metadata = ""
+        };
+
+        var fn = pluginBridge.GetMethod<Func<BaseItemType, double>>("NinjaPrice.GetBaseItemTypeValue");
+        var value = fn?.Invoke(data) ?? 0;
+        if (value == 0)
+            value = baseCurrencyValues.GetValueOrDefault(baseName, 0);
+
+        currencyValueCache[currencyName] = value;
+        return value;
+    }
+
     private KeyValuePair<Element, Reward> DetermineBestRewardForFloor3(Dictionary<Element, Reward> rewardValues)
     {
         if (floorWindow.FloorData.RoomChoices.Count == 8)
         {
             // Use Floor 4 logic since 2nd reward goes to "End of Floor 4"
-            return GetBestReward(rewardValues, sanctumRewardWindow, 2);
+            return GetBestReward(rewardValues, rewardElements, 2);
         }
 
-        return GetBestReward(rewardValues, sanctumRewardWindow, 1);
+        return GetBestReward(rewardValues, rewardElements, 1);
     }
-    private (int divCounter, int pactCounter, int rewardsWeCanTake) CalculateFloor4Metrics()
+    private (int highValueRoomCount, int pactCounter, int rewardsWeCanTake) CalculateFloor4Metrics()
     {
-        int divCounter = 0;
+        int highValueRoomCount = 0;
         int pactCounter = 0;
 
         List<(int, int)> path = [];
         pathFinder.CreateRoomWeightMap();
         path = pathFinder.FindBestPath();
+
+        var divineValue = GetCurrencyValue("Divine Orb");
 
         foreach (var room in path)
         {
@@ -309,10 +339,10 @@ private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, R
                 pactCounter++;
             }
 
-            // Idk what this one does
-            if (new[] { sanctumRoom?.Data?.Reward1, sanctumRoom?.Data?.Reward2, sanctumRoom?.Data?.Reward3 }.Any(x => x != null && (x.CurrencyName.Contains("Divine Orb") || x.CurrencyName.Contains("Mirror"))))
+            // Rooms worth reserving a duplication slot for: a Mirror, or anything priced at least a Divine.
+            if (new[] { sanctumRoom?.Data?.Reward1, sanctumRoom?.Data?.Reward2, sanctumRoom?.Data?.Reward3 }.Any(x => x != null && (IsMirror(x.CurrencyName) || GetCurrencyValue(x.CurrencyName) >= divineValue)))
             {
-                divCounter++;
+                highValueRoomCount++;
             }
         }
 
@@ -327,9 +357,9 @@ private static KeyValuePair<Element, Reward> GetBestReward(Dictionary<Element, R
         var duplicateRewardStat = gameState.Data.MapStats
             .FirstOrDefault(x => x.Key.ToString() == "MapLycia2DuplicateUpToXDeferredRewards");
 
-        int rewardsWeCanTake = duplicateRewardStat.Value - currentRewardCount - pactCounter - divCounter;
+        int rewardsWeCanTake = duplicateRewardStat.Value - currentRewardCount - pactCounter - highValueRoomCount;
 
-        return (divCounter, pactCounter, rewardsWeCanTake);
+        return (highValueRoomCount, pactCounter, rewardsWeCanTake);
     }
 
     private bool IsCurrentPlayerRoom((int, int) room)
